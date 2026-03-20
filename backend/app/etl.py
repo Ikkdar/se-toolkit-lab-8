@@ -10,7 +10,8 @@ Both require HTTP Basic Auth (email + password from settings).
 from datetime import datetime
 
 import httpx
-from sqlmodel import select, func
+from pydantic import BaseModel
+from sqlmodel import col, select, func
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.models.interaction import InteractionLog
@@ -20,11 +21,40 @@ from app.settings import settings
 
 
 # ---------------------------------------------------------------------------
+# API response schemas
+# ---------------------------------------------------------------------------
+
+
+class ApiItem(BaseModel):
+    type: str
+    title: str
+    lab: str
+    task: str | None = None
+
+
+class ApiLog(BaseModel):
+    id: int
+    student_id: str
+    lab: str
+    task: str | None = None
+    group: str = ""
+    score: float | None = None
+    passed: int | None = None
+    total: int | None = None
+    submitted_at: str
+
+
+class ApiLogsPage(BaseModel):
+    logs: list[ApiLog]
+    has_more: bool = False
+
+
+# ---------------------------------------------------------------------------
 # Extract — fetch data from the autochecker API
 # ---------------------------------------------------------------------------
 
 
-async def fetch_items() -> list[dict]:
+async def fetch_items() -> list[ApiItem]:
     """Fetch the lab/task catalog from the autochecker API."""
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.get(
@@ -32,12 +62,12 @@ async def fetch_items() -> list[dict]:
             auth=(settings.autochecker_email, settings.autochecker_password),
         )
         resp.raise_for_status()
-        return resp.json()
+        return [ApiItem.model_validate(item) for item in resp.json()]
 
 
-async def fetch_logs(since: datetime | None = None) -> list[dict]:
+async def fetch_logs(since: datetime | None = None) -> list[ApiLog]:
     """Fetch check results from the autochecker API with pagination."""
-    all_logs: list[dict] = []
+    all_logs: list[ApiLog] = []
 
     async with httpx.AsyncClient(timeout=60) as client:
         cursor = since
@@ -52,15 +82,14 @@ async def fetch_logs(since: datetime | None = None) -> list[dict]:
                 auth=(settings.autochecker_email, settings.autochecker_password),
             )
             resp.raise_for_status()
-            data = resp.json()
+            page = ApiLogsPage.model_validate(resp.json())
 
-            logs = data["logs"]
-            all_logs.extend(logs)
+            all_logs.extend(page.logs)
 
-            if not data.get("has_more") or not logs:
+            if not page.has_more or not page.logs:
                 break
 
-            cursor = datetime.fromisoformat(logs[-1]["submitted_at"])
+            cursor = datetime.fromisoformat(page.logs[-1].submitted_at)
 
     return all_logs
 
@@ -70,49 +99,47 @@ async def fetch_logs(since: datetime | None = None) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-async def load_items(items: list[dict], session: AsyncSession) -> int:
+async def load_items(items: list[ApiItem], session: AsyncSession) -> int:
     """Load items (labs and tasks) into the database."""
     created = 0
     lab_map: dict[str, ItemRecord] = {}
 
     # Process labs first
     for item in items:
-        if item["type"] != "lab":
+        if item.type != "lab":
             continue
-        title = item["title"]
         existing = (
             await session.exec(
                 select(ItemRecord).where(
-                    ItemRecord.type == "lab", ItemRecord.title == title
+                    ItemRecord.type == "lab", ItemRecord.title == item.title
                 )
             )
         ).first()
         if existing:
-            lab_map[item["lab"]] = existing
+            lab_map[item.lab] = existing
         else:
-            record = ItemRecord(type="lab", title=title)
+            record = ItemRecord(type="lab", title=item.title)
             session.add(record)
             await session.flush()
-            lab_map[item["lab"]] = record
+            lab_map[item.lab] = record
             created += 1
 
     # Process tasks
     for item in items:
-        if item["type"] != "task":
+        if item.type != "task":
             continue
-        parent = lab_map.get(item["lab"])
+        parent = lab_map.get(item.lab)
         if not parent:
             continue
-        title = item["title"]
         existing = (
             await session.exec(
                 select(ItemRecord).where(
-                    ItemRecord.title == title, ItemRecord.parent_id == parent.id
+                    ItemRecord.title == item.title, ItemRecord.parent_id == parent.id
                 )
             )
         ).first()
         if not existing:
-            record = ItemRecord(type="task", title=title, parent_id=parent.id)
+            record = ItemRecord(type="task", title=item.title, parent_id=parent.id)
             session.add(record)
             created += 1
 
@@ -121,33 +148,35 @@ async def load_items(items: list[dict], session: AsyncSession) -> int:
 
 
 async def load_logs(
-    logs: list[dict], items_catalog: list[dict], session: AsyncSession
+    logs: list[ApiLog],
+    items_catalog: list[ApiItem],
+    session: AsyncSession,
 ) -> int:
     """Load interaction logs into the database."""
     # Build lookup: (lab_short_id, task_short_id) → title
     title_lookup: dict[tuple[str, str | None], str] = {}
     for item in items_catalog:
-        key = (item["lab"], item.get("task"))
-        title_lookup[key] = item["title"]
+        key = (item.lab, item.task)
+        title_lookup[key] = item.title
 
     created = 0
     for log in logs:
         # Find or create learner
         learner = (
             await session.exec(
-                select(Learner).where(Learner.external_id == str(log["student_id"]))
+                select(Learner).where(Learner.external_id == log.student_id)
             )
         ).first()
         if not learner:
             learner = Learner(
-                external_id=str(log["student_id"]),
-                student_group=log.get("group", ""),
+                external_id=log.student_id,
+                student_group=log.group,
             )
             session.add(learner)
             await session.flush()
 
         # Find item
-        title = title_lookup.get((log["lab"], log.get("task")))
+        title = title_lookup.get((log.lab, log.task))
         if not title:
             continue
         item = (
@@ -159,29 +188,28 @@ async def load_logs(
         # Skip if already exists (idempotent upsert)
         existing = (
             await session.exec(
-                select(InteractionLog).where(InteractionLog.external_id == log["id"])
+                select(InteractionLog).where(InteractionLog.external_id == log.id)
             )
         ).first()
         if existing:
             continue
 
         # Use API score if available; otherwise compute from passed/total
-        score = log.get("score")
-        if score is None:
-            passed = log.get("passed")
-            total = log.get("total")
-            if passed is not None and total and total > 0:
-                score = round((passed / total) * 100, 1)
+        score = log.score
+        if score is None and log.passed is not None and log.total and log.total > 0:
+            score = round((log.passed / log.total) * 100, 1)
 
+        assert learner.id is not None
+        assert item.id is not None
         interaction = InteractionLog(
-            external_id=log["id"],
+            external_id=log.id,
             learner_id=learner.id,
             item_id=item.id,
             kind="attempt",
             score=score,
-            checks_passed=log.get("passed"),
-            checks_total=log.get("total"),
-            created_at=datetime.fromisoformat(log["submitted_at"]),
+            checks_passed=log.passed,
+            checks_total=log.total,
+            created_at=datetime.fromisoformat(log.submitted_at),
         )
         session.add(interaction)
         created += 1
@@ -195,7 +223,7 @@ async def load_logs(
 # ---------------------------------------------------------------------------
 
 
-async def sync(session: AsyncSession) -> dict:
+async def sync(session: AsyncSession) -> dict[str, int]:
     """Run the full ETL pipeline."""
     # Fetch and load items
     api_items = await fetch_items()
@@ -210,6 +238,6 @@ async def sync(session: AsyncSession) -> dict:
     new_count = await load_logs(logs, api_items, session)
 
     # Total count
-    total = (await session.exec(select(func.count(InteractionLog.id)))).one()
+    total = (await session.exec(select(func.count(col(InteractionLog.id))))).one()
 
     return {"new_records": new_count, "total_records": total}
