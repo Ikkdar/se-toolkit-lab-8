@@ -48,3 +48,8 @@ Paste your checkpoint evidence below. Add screenshots as image files in the repo
      2. Code fix (diff or description)
      3. Post-fix response to "What went wrong?" showing the real underlying failure
      4. Healthy follow-up report or transcript after recovery -->
+
+**Proactive health report (while PostgreSQL stopped):**
+
+cat /tmp/task4b.txt >> REPORT.md
+The cron job proactively posts health summaries to the same chat session every 2 minutes.
