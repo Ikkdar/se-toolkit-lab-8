@@ -1,0 +1,15 @@
+[project]
+name = "nanobot"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = "==3.14.2"
+dependencies = [
+    "lms-mcp",
+    "nanobot-ai>=0.1.4.post6",
+    "nanobot-webchat",
+]
+
+[tool.uv.sources]
+nanobot-webchat = { workspace = true, editable = true }
+lms-mcp = { workspace = true, editable = true }
