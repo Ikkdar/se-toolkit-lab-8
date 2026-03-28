@@ -14,6 +14,12 @@ from mcp.types import TextContent, Tool
 from pydantic import BaseModel, Field
 
 from mcp_lms.client import LMSClient
+from mcp_lms.observability_tools import (
+    logs_search,
+    logs_error_count,
+    traces_list,
+    traces_get,
+)
 
 _base_url: str = ""
 
@@ -36,6 +42,25 @@ class _TopLearnersQuery(_LabQuery):
     limit: int = Field(
         default=5, ge=1, description="Max learners to return (default 5)."
     )
+
+
+class _LogsSearchQuery(BaseModel):
+    query: str = Field(description="LogsQL query string (e.g., '_stream:{service=\"backend\"} AND level:error')")
+    limit: int = Field(default=100, ge=1, le=1000, description="Maximum number of log entries to return")
+
+
+class _LogsErrorCountQuery(BaseModel):
+    service: str = Field(default="backend", description="Service name to filter")
+    hours: int = Field(default=1, ge=1, le=24, description="Time window in hours")
+
+
+class _TracesListQuery(BaseModel):
+    service: str = Field(default="backend", description="Service name to filter")
+    limit: int = Field(default=20, ge=1, le=100, description="Maximum number of traces to return")
+
+
+class _TracesGetQuery(BaseModel):
+    trace_id: str = Field(description="The trace ID to fetch")
 
 
 # ---------------------------------------------------------------------------
@@ -61,13 +86,15 @@ def _client() -> LMSClient:
     return LMSClient(_base_url, _resolve_api_key())
 
 
-def _text(data: BaseModel | Sequence[BaseModel]) -> list[TextContent]:
-    """Serialize a pydantic model (or list of models) to a JSON text block."""
+def _text(data: BaseModel | Sequence[BaseModel] | dict | list) -> list[TextContent]:
+    """Serialize data to a JSON text block."""
     if isinstance(data, BaseModel):
         payload = data.model_dump()
-    else:
+    elif isinstance(data, (list, tuple)) and all(isinstance(i, BaseModel) for i in data):
         payload = [item.model_dump() for item in data]
-    return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
+    else:
+        payload = data
+    return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))]
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +137,27 @@ async def _completion_rate(args: _LabQuery) -> list[TextContent]:
 
 async def _sync_pipeline(_args: _NoArgs) -> list[TextContent]:
     return _text(await _client().sync_pipeline())
+
+
+# Observability tool handlers
+async def _logs_search(args: _LogsSearchQuery) -> list[TextContent]:
+    result = await logs_search(args.query, args.limit)
+    return _text(result)
+
+
+async def _logs_error_count(args: _LogsErrorCountQuery) -> list[TextContent]:
+    result = await logs_error_count(args.service, args.hours)
+    return _text(result)
+
+
+async def _traces_list(args: _TracesListQuery) -> list[TextContent]:
+    result = await traces_list(args.service, args.limit)
+    return _text(result)
+
+
+async def _traces_get(args: _TracesGetQuery) -> list[TextContent]:
+    result = await traces_get(args.trace_id)
+    return _text(result)
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +231,32 @@ _register(
     "Trigger the LMS sync pipeline. May take a moment.",
     _NoArgs,
     _sync_pipeline,
+)
+
+# Observability tools
+_register(
+    "logs_search",
+    "Search VictoriaLogs using LogsQL query. Use for finding errors, debugging issues.",
+    _LogsSearchQuery,
+    _logs_search,
+)
+_register(
+    "logs_error_count",
+    "Count errors per service over a time window. Use for monitoring service health.",
+    _LogsErrorCountQuery,
+    _logs_error_count,
+)
+_register(
+    "traces_list",
+    "List recent traces for a service. Use for understanding request flow and latency.",
+    _TracesListQuery,
+    _traces_list,
+)
+_register(
+    "traces_get",
+    "Fetch a specific trace by ID. Use for detailed debugging of a specific request.",
+    _TracesGetQuery,
+    _traces_get,
 )
 
 
